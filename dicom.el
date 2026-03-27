@@ -91,6 +91,10 @@
 The list elements are either symbols or regular expressions."
   :type '(repeat (choice string symbol)))
 
+(defcustom dicom-show-tags t
+  "Non-nil to show DICOM tag index alongside attribute names."
+  :type 'boolean)
+
 (defcustom dicom-cache-dir (expand-file-name
                             (file-name-concat
                              (or (getenv "XDG_CACHE_HOME") "~/.cache/")
@@ -121,6 +125,10 @@ progress:${percent-pos}%%' %s) & disown"
   '((t :inherit header-line :extend t))
   "Item title face.")
 
+(defface dicom-tag
+  '((t :inherit shadow))
+  "DICOM tag index face.")
+
 ;;;; Keymaps
 
 (defvar-keymap dicom-image-map
@@ -137,6 +145,8 @@ progress:${percent-pos}%%' %s) & disown"
   "r" #'dicom-rotate
   "p" #'dicom-previous
   "n" #'dicom-next
+  "t" #'dicom-toggle-sort
+  "P" #'dicom-toggle-private-tags
   "TAB" #'outline-cycle
   "<backtab>" #'outline-cycle-buffer)
 
@@ -148,6 +158,8 @@ progress:${percent-pos}%%' %s) & disown"
     ["Smaller" dicom-smaller]
     ["Rotate" dicom-rotate]
     ["Play" dicom-play]
+    ["Sort by Tag" dicom-toggle-sort]
+    ["Show Private Tags" dicom-toggle-private-tags]
     "--"
     ["Manual" (info "(dicom)")]
     ["Customize" (customize-group 'dicom)]))
@@ -175,6 +187,18 @@ progress:${percent-pos}%%' %s) & disown"
 
 (defvar dicom--thumb nil
   "Thumbnail placeholder image.")
+
+(defvar dicom--collecting-tags nil
+  "Hash table populated during `dicom--convert' to collect DICOM tag strings.")
+
+(defvar-local dicom--tags nil
+  "Hash table mapping attribute symbols to their DICOM tag strings, e.g. \"(0008,0060)\".")
+
+(defvar-local dicom--sort-by-tag nil
+  "Non-nil to sort attributes by DICOM tag index instead of alphabetically.")
+
+(defvar-local dicom--show-private-tags t
+  "Non-nil to show private DICOM tags (those with an odd group number).")
 
 ;;;; Internal functions
 
@@ -232,42 +256,78 @@ progress:${percent-pos}%%' %s) & disown"
                     (dom-children dom))))
 
 (defun dicom--sort-alist (alist)
-  "Sort ALIST by keys."
-  (sort alist (lambda (x y) (string< (car x) (car y)))))
+  "Sort ALIST alphabetically by keys."
+  (sort (copy-sequence alist) (lambda (x y) (string< (car x) (car y)))))
+
+(defun dicom--entry-tag (entry)
+  "Return the DICOM tag string for ENTRY, or nil."
+  (let ((v (cdr entry)))
+    (or (and (stringp v) (get-text-property 0 'dicom--tag v))
+        (and dicom--tags (gethash (car entry) dicom--tags)))))
+
+(defun dicom--private-tag-p (tag)
+  "Non-nil if TAG string (e.g. \"(0009,0010)\") is a private DICOM tag.
+Private tags have an odd group number (first four hex digits)."
+  (and (stringp tag)
+       (> (length tag) 5)
+       (= 1 (logand (string-to-number (substring tag 1 5) 16) 1))))
 
 (defun dicom--convert (dom)
   "Convert DOM to nested lists."
   (pcase (dom-tag dom)
     ((or 'item 'data-set)
-     (nconc (dicom--sort-alist (dicom--convert-children dom 'element))
-            (dicom--sort-alist (dicom--convert-children dom 'sequence))))
+     ;; Preserve natural DICOM tag order; sorting happens at display time.
+     (delq nil (mapcar (lambda (x)
+                         (and (consp x)
+                              (memq (dom-tag x) '(element sequence))
+                              (dicom--convert x)))
+                       (dom-children dom))))
     ('element
-     (when-let* ((name (dom-attr dom 'name))
-                 ((not (or (equal (dom-attr dom 'loaded) "no")
-                           (equal (dom-attr dom 'binary) "hidden")
-                           (let (case-fold-search)
-                             (string-match-p dicom-attribute-filter name))))))
-       (cons (intern name) (replace-regexp-in-string
-                            "[ \t\n^]+" " " (with-no-warnings (dom-text dom))))))
+     (when-let* ((name (dom-attr dom 'name)))
+       (let* ((tag (dom-attr dom 'tag))
+              (private (dicom--private-tag-p tag)))
+         (unless (or (equal (dom-attr dom 'loaded) "no")
+                     (equal (dom-attr dom 'binary) "hidden")
+                     ;; Apply the name filter only to non-private tags so that
+                     ;; private tags (e.g. "Unknown Tag & Data") are always
+                     ;; stored and can be shown/hidden at display time.
+                     (and (not private)
+                          (let (case-fold-search)
+                            (string-match-p dicom-attribute-filter name))))
+           (let* ((sym (intern name))
+                  (value (replace-regexp-in-string
+                          "[ \t\n^]+" " " (with-no-warnings (dom-text dom)))))
+             (when (and tag dicom--collecting-tags)
+               (puthash sym tag dicom--collecting-tags))
+             (cons sym (if tag (propertize value 'dicom--tag tag) value)))))))
     ('sequence
-     (when-let* ((name (dom-attr dom 'name))
-                 ((not (let (case-fold-search)
-                         (string-match-p dicom-attribute-filter name))))
-                 (children (dicom--convert-children dom)))
-       (cons (intern name) children)))))
+     (when-let* ((name (dom-attr dom 'name)))
+       (let* ((tag (dom-attr dom 'tag))
+              (private (dicom--private-tag-p tag)))
+         (unless (and (not private)
+                      (let (case-fold-search)
+                        (string-match-p dicom-attribute-filter name)))
+           (when-let* ((children (dicom--convert-children dom)))
+             (let* ((sym (intern name)))
+               (when (and tag dicom--collecting-tags)
+                 (puthash sym tag dicom--collecting-tags))
+               (cons sym children)))))))))
 
 (defun dicom--read (file)
-  "Read DICOM FILE and return list of items."
-  (with-temp-buffer
-    (let ((coding-system-for-read 'latin-1)
-          (coding-system-for-write 'latin-1))
-      (unless (eq 0 (call-process "dcm2xml" nil t nil
-                                  "--quiet" "--charset-assume" "latin-1" file))
-        (error "DICOM: Reading DICOM metadata with dcm2xml failed")))
-    (let ((dicom-attribute-filter (mapconcat (lambda (x) (format "%s" x))
-                                             dicom-attribute-filter
-                                             "\\|")))
-      (dicom--convert (dom-child-by-tag (libxml-parse-xml-region) 'data-set)))))
+  "Read DICOM FILE and return (data . tag-map)."
+  (let ((dicom--collecting-tags (make-hash-table :test 'eq)))
+    (cons
+     (with-temp-buffer
+       (let ((coding-system-for-read 'latin-1)
+             (coding-system-for-write 'latin-1))
+         (unless (eq 0 (call-process "dcm2xml" nil t nil
+                                     "--quiet" "--charset-assume" "latin-1" file))
+           (error "DICOM: Reading DICOM metadata with dcm2xml failed")))
+       (let ((dicom-attribute-filter (mapconcat (lambda (x) (format "%s" x))
+                                                dicom-attribute-filter
+                                                "\\|")))
+         (dicom--convert (dom-child-by-tag (libxml-parse-xml-region) 'data-set))))
+     dicom--collecting-tags)))
 
 (defun dicom--image-buffer ()
   "Return image buffer or throw an error."
@@ -411,7 +471,20 @@ The command is specified as FMT string with ARGS."
 
 (defun dicom--item (level item &optional indent)
   "Insert ITEM at LEVEL into buffer."
-  (pcase-dolist (`(,k . ,v) item)
+  (let* ((lst (if dicom--show-private-tags item
+               (seq-remove (lambda (e) (dicom--private-tag-p (dicom--entry-tag e)))
+                           item)))
+         (lst (if dicom--sort-by-tag
+                  (sort (copy-sequence lst)
+                        (lambda (x y)
+                          (let ((tx (dicom--entry-tag x))
+                                (ty (dicom--entry-tag y)))
+                            (cond ((and tx ty) (string< tx ty))
+                                  (tx t) (ty nil)
+                                  (t (string< (symbol-name (car x))
+                                              (symbol-name (car y))))))))
+                (dicom--sort-alist lst))))
+  (pcase-dolist (`(,k . ,v) lst)
     (cond
      ((eq k 'DirectoryRecordSequence)
       (dolist (item v)
@@ -439,12 +512,18 @@ The command is specified as FMT string with ARGS."
             (dicom--item (1+ level) item)))))
      ((not (eq k 'DirectoryRecordType))
       (let* ((k (symbol-name k))
+             (tag (and dicom-show-tags (stringp v)
+                       (get-text-property 0 'dicom--tag v)))
              (s k))
         (when (> (length s) dicom-attribute-width)
           (setq s (truncate-string-to-width k dicom-attribute-width 0 nil "…"))
           (put-text-property 0 (length s) 'help-echo k s))
         (setq s (string-pad s dicom-attribute-width))
-        (insert (or indent "    ") s "  " v "\n"))))))
+        (insert (or indent "    ")
+                (if dicom-show-tags
+                    (propertize (format "%-11s " (or tag "")) 'face 'dicom-tag)
+                  "")
+                s "  " v "\n")))))))
 
 (defun dicom--placeholder (w h)
   "Placeholder image with W and H."
@@ -508,10 +587,12 @@ The command is specified as FMT string with ARGS."
 
 (defun dicom--setup-locals (file)
   "Initialize buffer locals for FILE."
+  (pcase-let ((`(,data . ,tags) (dicom--read file)))
+    (setq-local dicom--data data
+                dicom--tags tags))
   (setq-local dicom--queue nil
               dicom--procs nil
               dicom--file file
-              dicom--data (dicom--read file)
               default-directory (file-name-directory dicom--file)
               buffer-read-only t
               truncate-lines nil
@@ -577,6 +658,20 @@ The command is specified as FMT string with ARGS."
   "Image smaller by N."
   (interactive "p" dicom-mode)
   (dicom-larger (- n)))
+
+(defun dicom-toggle-sort ()
+  "Toggle sort order between alphabetical name and DICOM tag index."
+  (interactive nil dicom-mode)
+  (setq dicom--sort-by-tag (not dicom--sort-by-tag))
+  (dicom--setup-content)
+  (message "DICOM: Sorting by %s" (if dicom--sort-by-tag "tag index" "name")))
+
+(defun dicom-toggle-private-tags ()
+  "Toggle display of private DICOM tags (those with an odd group number)."
+  (interactive nil dicom-mode)
+  (setq dicom--show-private-tags (not dicom--show-private-tags))
+  (dicom--setup-content)
+  (message "DICOM: Private tags %s" (if dicom--show-private-tags "shown" "hidden")))
 
 (defun dicom-next (&optional n)
   "Go forward N images."
@@ -701,6 +796,9 @@ The command is specified as FMT string with ARGS."
 (progn
   (defun dicom--magic-p ()
     (save-excursion (goto-char 129) (looking-at-p "DICM")))
+  ;; Remove stale entries from older versions that used `dicom-open' directly.
+  (setq auto-mode-alist (rassq-delete-all 'dicom-open auto-mode-alist)
+        magic-mode-alist (rassq-delete-all 'dicom-open magic-mode-alist))
   (add-to-list 'magic-mode-alist '(dicom--magic-p . dicom-auto-mode))
   (add-to-list 'auto-mode-alist '("\\.\\(?:dcm\\|ima\\)\\'" . dicom-auto-mode))
   (add-to-list 'auto-mode-alist '("DICOMDIR" . dicom-auto-mode)))
